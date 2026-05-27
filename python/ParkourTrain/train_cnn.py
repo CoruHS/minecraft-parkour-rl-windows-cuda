@@ -3,6 +3,7 @@ import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 import csv
+import json
 import sys
 import subprocess
 import time
@@ -23,12 +24,25 @@ from model import ParkourCNN
 
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints_cnn"
 EPISODE_LOG_PATH = PROJECT_ROOT / "training_logs" / "episodes_cnn.csv"
+EVAL_LOG_PATH = PROJECT_ROOT / "training_logs" / "eval_cnn.csv"
 EPISODE_CHECKPOINT_INTERVAL = 50
 STEP_CHECKPOINT_INTERVAL = 50_000
 EVAL_INTERVAL_STEPS = 10_000
 EVAL_EPISODES = 5
 BEST_MEAN_CHECKPOINT = "best_mean.pt"
 BEST_WORST_CHECKPOINT = "best_worst.pt"
+
+# PPO entropy bonus coefficient. Lower = sharper / less exploratory policy.
+ENTROPY_COEF = 0.001
+# Camera curriculum: mask yaw/pitch actions during the first N training steps so the agent
+# learns clean forward/jump movement before camera control enters the action space.
+# Set to 0 to disable. Eval is NEVER masked.
+MASK_CAMERA_ACTIONS_INITIAL_STEPS = 50_000
+CAMERA_ACTION_IDS = {14, 15, 16, 17, 18, 19}
+# Finite (not -inf) so masked actions get ~0 probability without producing NaN entropy.
+MASKED_LOGIT_VALUE = -1e9
+# Flat reward penalty per camera (yaw/pitch) action, applied by the env. 0.0 disables it.
+CAMERA_ACTION_PENALTY = 0.02
 
 class RolloutBuffer:
     def __init__(self):
@@ -38,14 +52,16 @@ class RolloutBuffer:
         self.rewards = []
         self.values = []
         self.dones = []
+        self.masked = []
 
-    def add(self, state, action, log_prob, reward, value, done):
+    def add(self, state, action, log_prob, reward, value, done, masked=False):
         self.states.append(state)
         self.actions.append(action)
         self.log_probs.append(log_prob)
         self.rewards.append(reward)
         self.values.append(value)
         self.dones.append(done)
+        self.masked.append(masked)
 
     def clear(self):
         self.__init__()
@@ -61,13 +77,53 @@ def copy_obs(obs):
     }
 
 
-def choose_action_deterministic(model, obs):
+def eval_diagnostics(model, obs):
+    """Greedy action for one observation plus diagnostics: (action, top_prob, entropy)."""
     with torch.no_grad():
         device = next(model.parameters()).device
         frame = torch.as_tensor(obs["frame"], dtype=torch.float32, device=device).unsqueeze(0)
         mlp = torch.as_tensor(obs["mlp"], dtype=torch.float32, device=device).unsqueeze(0)
         logits, _ = model(frame, mlp)
-        return int(torch.argmax(logits, dim=-1).item())
+        probs = torch.softmax(logits, dim=-1)
+        action = int(torch.argmax(logits, dim=-1).item())
+        top_prob = float(probs.max().item())
+        entropy = float(torch.distributions.Categorical(probs=probs).entropy().item())
+    return action, top_prob, entropy
+
+
+def choose_action_deterministic(model, obs):
+    action, _, _ = eval_diagnostics(model, obs)
+    return action
+
+
+def format_action_counts(action_counts):
+    total = sum(action_counts) or 1
+    parts = [
+        f"{action_id}={count} ({100.0 * count / total:.0f}%)"
+        for action_id, count in enumerate(action_counts)
+        if count > 0
+    ]
+    return ", ".join(parts) if parts else "(none)"
+
+
+def choose_action_sampled_masked(model, obs, masked_action_ids):
+    """Sample a training action with the given action IDs masked out.
+
+    Returns (action, log_prob, value) under the masked distribution, so the stored
+    log_prob matches the policy that actually acted. Training-only; eval is never masked.
+    """
+    with torch.no_grad():
+        device = next(model.parameters()).device
+        frame = torch.as_tensor(obs["frame"], dtype=torch.float32, device=device).unsqueeze(0)
+        mlp = torch.as_tensor(obs["mlp"], dtype=torch.float32, device=device).unsqueeze(0)
+        logits, value = model(frame, mlp)
+        if masked_action_ids:
+            cols = torch.as_tensor(sorted(masked_action_ids), dtype=torch.long, device=device)
+            logits[:, cols] = MASKED_LOGIT_VALUE
+        dist = torch.distributions.Categorical(logits=logits)
+        action = dist.sample()
+        log_prob = dist.log_prob(action).squeeze()
+    return action.item(), log_prob, value.squeeze()
 
 
 def compute_gae(rewards, values, dones, gamma = 0.99, lam = 0.95):
@@ -97,6 +153,11 @@ def ppo_update(model, optimizer, buffer, device, epochs = 4, clip_epsilon= 0.2, 
     actions = torch.as_tensor(buffer.actions, dtype=torch.long, device=device)
     old_log_probs = torch.stack(buffer.log_probs).detach().to(device)
     values = [v.item() for v in buffer.values]
+    # Per-step flag: was the camera-action mask active when this transition was collected?
+    # Masked transitions must be re-masked below so the PPO ratio/entropy match the policy
+    # that actually acted (otherwise the entropy bonus inflates the masked actions).
+    masked_flags = torch.as_tensor(buffer.masked, dtype=torch.bool, device=device)
+    camera_cols = torch.as_tensor(sorted(CAMERA_ACTION_IDS), dtype=torch.long, device=device)
 
     advantages, returns = compute_gae(buffer.rewards, values, buffer.dones)
     advantages = advantages.to(device)
@@ -121,9 +182,16 @@ def ppo_update(model, optimizer, buffer, device, epochs = 4, clip_epsilon= 0.2, 
             batch_old_log_probs = old_log_probs[batch_idx]
             batch_advantages = advantages[batch_idx]
             batch_returns = returns[batch_idx]
+            batch_masked = masked_flags[batch_idx]
 
             # current predictions
             logits, values_pred = model(batch_frames, batch_mlp_states)
+            # Re-apply the camera mask for transitions collected under the curriculum mask,
+            # so recomputed log-probs/entropy come from the same distribution that acted.
+            if batch_masked.any():
+                logits = logits.clone()
+                rows = batch_masked.nonzero(as_tuple=True)[0]
+                logits[rows.unsqueeze(1), camera_cols.unsqueeze(0)] = MASKED_LOGIT_VALUE
             dist = torch.distributions.Categorical(logits=logits)
             new_log_probs = dist.log_prob(batch_actions)
             entropy = dist.entropy().mean()
@@ -136,7 +204,7 @@ def ppo_update(model, optimizer, buffer, device, epochs = 4, clip_epsilon= 0.2, 
 
             critic_loss = nn.MSELoss()(values_pred.squeeze(-1), batch_returns)
 
-            loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+            loss = actor_loss + 0.5 * critic_loss - ENTROPY_COEF * entropy
 
             optimizer.zero_grad()
             loss.backward()
@@ -154,7 +222,11 @@ def save_checkpoint(model, filename, update_latest=True):
 
 
 def evaluate_policy(model, env, episodes=EVAL_EPISODES):
+    num_actions = len(env.action_table)
     rewards = []
+    action_counts = [0] * num_actions
+    top_probs = []
+    entropies = []
     was_training = model.training
     model.eval()
 
@@ -164,7 +236,10 @@ def evaluate_policy(model, env, episodes=EVAL_EPISODES):
             episode_reward = 0.0
 
             while True:
-                action = choose_action_deterministic(model, obs)
+                action, top_prob, entropy = eval_diagnostics(model, obs)
+                action_counts[action] += 1
+                top_probs.append(top_prob)
+                entropies.append(entropy)
                 obs, reward, terminated, truncated, info = env.step(action)
                 episode_reward += reward
                 if terminated or truncated:
@@ -175,7 +250,14 @@ def evaluate_policy(model, env, episodes=EVAL_EPISODES):
         if was_training:
             model.train()
 
-    return float(np.mean(rewards)), float(np.min(rewards)), float(np.max(rewards))
+    return {
+        "mean": float(np.mean(rewards)),
+        "worst": float(np.min(rewards)),
+        "best": float(np.max(rewards)),
+        "action_counts": action_counts,
+        "mean_top_prob": float(np.mean(top_probs)) if top_probs else 0.0,
+        "mean_entropy": float(np.mean(entropies)) if entropies else 0.0,
+    }
 
 
 def format_duration(seconds):
@@ -244,6 +326,44 @@ def log_episode(
         )
 
 
+def log_eval(steps_done, stats, saved_best_mean, saved_best_worst, elapsed_seconds):
+    EVAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not EVAL_LOG_PATH.exists()
+
+    with EVAL_LOG_PATH.open("a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "steps_done",
+                "mean_reward",
+                "worst_reward",
+                "best_reward",
+                "saved_best_mean",
+                "saved_best_worst",
+                "mean_top_prob",
+                "mean_entropy",
+                "action_counts",
+                "elapsed_seconds",
+            ],
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerow(
+            {
+                "steps_done": steps_done,
+                "mean_reward": stats["mean"],
+                "worst_reward": stats["worst"],
+                "best_reward": stats["best"],
+                "saved_best_mean": int(saved_best_mean),
+                "saved_best_worst": int(saved_best_worst),
+                "mean_top_prob": stats["mean_top_prob"],
+                "mean_entropy": stats["mean_entropy"],
+                "action_counts": json.dumps(stats["action_counts"]),
+                "elapsed_seconds": elapsed_seconds,
+            }
+        )
+
+
 def train():
     env = None
     process = None
@@ -258,7 +378,7 @@ def train():
             print("Waiting for Minecraft socket...")
             wait_for_minecraft_socket(process)
 
-        env = ParkourRL() # no need to add any parameters.
+        env = ParkourRL(camera_action_penalty=CAMERA_ACTION_PENALTY)
         num_actions = len(env.action_table)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -287,11 +407,15 @@ def train():
         while steps_done < total_timesteps:
             # ---- collect experience ----
             for _ in range(rollout_steps):
-                action, log_prob, value = model.get_action(obs)
+                camera_masked = steps_done < MASK_CAMERA_ACTIONS_INITIAL_STEPS
+                if camera_masked:
+                    action, log_prob, value = choose_action_sampled_masked(model, obs, CAMERA_ACTION_IDS)
+                else:
+                    action, log_prob, value = model.get_action(obs)
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
 
-                buffer.add(copy_obs(obs), action, log_prob, reward, value, float(done))
+                buffer.add(copy_obs(obs), action, log_prob, reward, value, float(done), camera_masked)
 
                 obs = next_obs
                 episode_reward += reward
@@ -359,21 +483,32 @@ def train():
                 last_step_checkpoint = steps_done
 
             if steps_done >= next_eval_step:
-                mean_reward, worst_reward, best_reward = evaluate_policy(model, env)
+                stats = evaluate_policy(model, env)
+                mean_reward = stats["mean"]
+                worst_reward = stats["worst"]
+                best_reward = stats["best"]
                 print(
                     f"Eval mean={mean_reward:.2f}, "
-                    f"worst={worst_reward:.2f}, best={best_reward:.2f}"
+                    f"worst={worst_reward:.2f}, best={best_reward:.2f}  "
+                    f"top_prob={stats['mean_top_prob']:.3f}  "
+                    f"entropy={stats['mean_entropy']:.3f}"
                 )
+                print(f"  action counts -> {format_action_counts(stats['action_counts'])}")
 
-                if mean_reward > best_mean_reward:
+                saved_best_mean = mean_reward > best_mean_reward
+                if saved_best_mean:
                     best_mean_reward = mean_reward
                     path = save_checkpoint(model, BEST_MEAN_CHECKPOINT, update_latest=False)
                     print(f"Saved best mean checkpoint: {path}")
 
-                if worst_reward > best_worst_reward:
+                saved_best_worst = worst_reward > best_worst_reward
+                if saved_best_worst:
                     best_worst_reward = worst_reward
                     path = save_checkpoint(model, BEST_WORST_CHECKPOINT, update_latest=False)
                     print(f"Saved best worst checkpoint: {path}")
+
+                eval_elapsed = time.time() - training_start_time
+                log_eval(steps_done, stats, saved_best_mean, saved_best_worst, eval_elapsed)
 
                 while next_eval_step <= steps_done:
                     next_eval_step += EVAL_INTERVAL_STEPS

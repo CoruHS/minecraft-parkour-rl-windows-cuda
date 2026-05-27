@@ -3,7 +3,6 @@
 	"package": "coru.minecraftparkourrl.client.mixin",
 	"compatibilityLevel": "JAVA_17",
 	"client": [
-		"ExampleClientMixin",
 		"MinecraftClientAccessor",
 		"MinecraftServerTickrateMixin",
 		"RenderTickCounterAccessor"

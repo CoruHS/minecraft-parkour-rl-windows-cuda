@@ -192,6 +192,7 @@ class ParkourRL(gym.Env):
                  time_penalty: float = 0.005,
                  fall_penalty: float = 5.0,
                  goal_bonus: float = 50.0,
+                 camera_action_penalty: float = 0.0,
                  action_table: list = ACTION_TABLE,
                  max_steps=1000):
         # Initilize basically all the variables the code will utilize(yes theres that many).
@@ -218,6 +219,9 @@ class ParkourRL(gym.Env):
         self.time_penalty = time_penalty
         self.fall_penalty = fall_penalty
         self.goal_bonus = goal_bonus
+        self.camera_action_penalty = camera_action_penalty
+        # Whether the most recent action moved the camera (yaw/pitch); set in step().
+        self.last_action_is_camera = False
         self.host = MINECRAFT_HOST
         self.port = MINECRAFT_PORT
         self.socket = socket.create_connection((self.host, self.port), timeout=10)
@@ -299,6 +303,8 @@ class ParkourRL(gym.Env):
         # step() makes the environment play the game, calculate rewards, and choose actions until reset() is called.
 
         action = self.action_table[int(actionid)]
+        # Remember whether this action moves the camera so _compute_reward can penalize it.
+        self.last_action_is_camera = action["yaw_delta"] != 0.0 or action["pitch_delta"] != 0.0
         self._send_action(action)
 
         reward = 0.0
@@ -368,6 +374,11 @@ class ParkourRL(gym.Env):
         reward -= pitch_error * self.pitch_penalty
 
         reward -= self.time_penalty
+
+        # Optional flat penalty for choosing a camera (yaw/pitch) action at all. Off by default
+        # (camera_action_penalty=0.0); applied per telemetry tick like the other penalties above.
+        if self.last_action_is_camera:
+            reward -= self.camera_action_penalty
 
         fell = current_position[1] < self.fall_y
         reached_goal = current_distance < self.goal_radius
