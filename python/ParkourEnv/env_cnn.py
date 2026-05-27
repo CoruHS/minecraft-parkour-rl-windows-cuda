@@ -25,6 +25,10 @@ FRAME_H = 84
 FRAME_C = 3
 
 
+def wrap_degrees(angle):
+    return (angle + 180.0) % 360.0 - 180.0
+
+
 def _action(
     forward=False,
     back=False,
@@ -178,6 +182,16 @@ class ParkourRL(gym.Env):
                  goal_y: float = goal_y,
                  goal_z: float = goal_z,
                  fall_y=None,
+                 center_x: float = 0.0,
+                 target_yaw: float = 0.0,
+                 target_pitch: float = 0.0,
+                 progress_weight: float = 2.0,
+                 lane_penalty: float = 0.05,
+                 yaw_penalty: float = 0.01,
+                 pitch_penalty: float = 0.005,
+                 time_penalty: float = 0.005,
+                 fall_penalty: float = 5.0,
+                 goal_bonus: float = 50.0,
                  action_table: list = ACTION_TABLE,
                  max_steps=1000):
         # Initilize basically all the variables the code will utilize(yes theres that many).
@@ -194,6 +208,16 @@ class ParkourRL(gym.Env):
         self.max_steps = max_steps
         self.elapsed_steps = 0
         self.last_distance_to_goal = None
+        self.center_x = center_x
+        self.target_yaw = target_yaw
+        self.target_pitch = target_pitch
+        self.progress_weight = progress_weight
+        self.lane_penalty = lane_penalty
+        self.yaw_penalty = yaw_penalty
+        self.pitch_penalty = pitch_penalty
+        self.time_penalty = time_penalty
+        self.fall_penalty = fall_penalty
+        self.goal_bonus = goal_bonus
         self.host = MINECRAFT_HOST
         self.port = MINECRAFT_PORT
         self.socket = socket.create_connection((self.host, self.port), timeout=10)
@@ -203,6 +227,14 @@ class ParkourRL(gym.Env):
         if goal_position is None:
             goal_position = (goal_x, goal_y, goal_z)
         self.goal_position = np.asarray(goal_position, dtype=np.float32)
+        self.start_position = np.array([x, y, z], dtype=np.float32)
+        goal_delta = self.goal_position - self.start_position
+        horizontal_goal_delta = np.array([goal_delta[0], 0.0, goal_delta[2]], dtype=np.float32)
+        horizontal_goal_distance = np.linalg.norm(horizontal_goal_delta)
+        if horizontal_goal_distance > 1e-6:
+            self.progress_dir = horizontal_goal_delta / horizontal_goal_distance
+        else:
+            self.progress_dir = np.zeros(3, dtype=np.float32)
         self.obs_shape = {
             "frame": (self.stack_size * FRAME_C, FRAME_H, FRAME_W),
             "mlp": (self.stack_size, 14),
@@ -315,11 +347,34 @@ class ParkourRL(gym.Env):
         return self.state_stack.copy()
 
     def _compute_reward(self, packet):
-        # calculate the reward based on the distance of the known last position and goal position.
         current_position = self._position_from_packet(packet)
         current_distance = np.linalg.norm(current_position - self.goal_position)
-        reward = self.last_distance_to_goal - current_distance
-        reward -= 0.01
+        if self.last_position is None:
+            delta = np.zeros(3, dtype=np.float32)
+        else:
+            delta = current_position - self.last_position
+
+        reward = float(np.dot(delta, self.progress_dir) * self.progress_weight)
+
+        lane_error = abs(float(current_position[0]) - self.center_x)
+        reward -= lane_error * self.lane_penalty
+
+        rotation = packet.get("rotation", {})
+        yaw = float(rotation.get("yaw", self.target_yaw))
+        pitch = float(rotation.get("pitch", self.target_pitch))
+        yaw_error = abs(wrap_degrees(yaw - self.target_yaw)) / 180.0
+        pitch_error = abs(pitch - self.target_pitch) / 90.0
+        reward -= yaw_error * self.yaw_penalty
+        reward -= pitch_error * self.pitch_penalty
+
+        reward -= self.time_penalty
+
+        fell = current_position[1] < self.fall_y
+        reached_goal = current_distance < self.goal_radius
+        if fell:
+            reward -= self.fall_penalty
+        if reached_goal:
+            reward += self.goal_bonus
 
         self.last_distance_to_goal = current_distance
         self.last_position = current_position

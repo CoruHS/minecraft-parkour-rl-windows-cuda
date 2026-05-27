@@ -25,8 +25,12 @@ from model import ParkourCNN
 
 def find_latest_checkpoint():
     checkpoint_dir = PROJECT_ROOT / "checkpoints_cnn"
-    candidates = []
-    candidates.extend(checkpoint_dir.glob("*.pt"))
+    for filename in ("best_worst.pt", "best_mean.pt", "latest.pt"):
+        checkpoint_path = checkpoint_dir / filename
+        if checkpoint_path.exists():
+            return checkpoint_path
+
+    candidates = list(checkpoint_dir.glob("*.pt"))
 
     unique_candidates = list(dict.fromkeys(path.resolve() for path in candidates))
     if not unique_candidates:
@@ -60,7 +64,7 @@ def parse_args():
         "--checkpoint",
         type=Path,
         default=None,
-        help="Path to a checkpoint_*.pt file. Defaults to latest checkpoint found.",
+        help="Path to a .pt checkpoint. Defaults to best_worst, best_mean, latest, then newest.",
     )
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=1000000)

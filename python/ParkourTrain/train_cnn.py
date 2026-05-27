@@ -25,6 +25,10 @@ CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints_cnn"
 EPISODE_LOG_PATH = PROJECT_ROOT / "training_logs" / "episodes_cnn.csv"
 EPISODE_CHECKPOINT_INTERVAL = 50
 STEP_CHECKPOINT_INTERVAL = 50_000
+EVAL_INTERVAL_STEPS = 10_000
+EVAL_EPISODES = 5
+BEST_MEAN_CHECKPOINT = "best_mean.pt"
+BEST_WORST_CHECKPOINT = "best_worst.pt"
 
 class RolloutBuffer:
     def __init__(self):
@@ -55,6 +59,15 @@ def copy_obs(obs):
         "frame": obs["frame"].copy(),
         "mlp": obs["mlp"].copy(),
     }
+
+
+def choose_action_deterministic(model, obs):
+    with torch.no_grad():
+        device = next(model.parameters()).device
+        frame = torch.as_tensor(obs["frame"], dtype=torch.float32, device=device).unsqueeze(0)
+        mlp = torch.as_tensor(obs["mlp"], dtype=torch.float32, device=device).unsqueeze(0)
+        logits, _ = model(frame, mlp)
+        return int(torch.argmax(logits, dim=-1).item())
 
 
 def compute_gae(rewards, values, dones, gamma = 0.99, lam = 0.95):
@@ -131,12 +144,38 @@ def ppo_update(model, optimizer, buffer, device, epochs = 4, clip_epsilon= 0.2, 
             optimizer.step()
 
 
-def save_checkpoint(model, filename):
+def save_checkpoint(model, filename, update_latest=True):
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     checkpoint_path = CHECKPOINT_DIR / filename
     torch.save(model.state_dict(), checkpoint_path)
-    torch.save(model.state_dict(), CHECKPOINT_DIR / "latest.pt")
+    if update_latest:
+        torch.save(model.state_dict(), CHECKPOINT_DIR / "latest.pt")
     return checkpoint_path
+
+
+def evaluate_policy(model, env, episodes=EVAL_EPISODES):
+    rewards = []
+    was_training = model.training
+    model.eval()
+
+    try:
+        for _ in range(episodes):
+            obs, info = env.reset()
+            episode_reward = 0.0
+
+            while True:
+                action = choose_action_deterministic(model, obs)
+                obs, reward, terminated, truncated, info = env.step(action)
+                episode_reward += reward
+                if terminated or truncated:
+                    break
+
+            rewards.append(episode_reward)
+    finally:
+        if was_training:
+            model.train()
+
+    return float(np.mean(rewards)), float(np.min(rewards)), float(np.max(rewards))
 
 
 def format_duration(seconds):
@@ -238,6 +277,9 @@ def train():
         episode_steps = 0
         last_checkpoint_episode = 0
         last_step_checkpoint = 0
+        next_eval_step = EVAL_INTERVAL_STEPS
+        best_mean_reward = -float("inf")
+        best_worst_reward = -float("inf")
         training_start_time = time.time()
 
         obs, info = env.reset()
@@ -315,6 +357,29 @@ def train():
                 path = save_checkpoint(model, f"checkpoint_step_{steps_done}.pt")
                 print(f"Saved timestep checkpoint: {path}")
                 last_step_checkpoint = steps_done
+
+            if steps_done >= next_eval_step:
+                mean_reward, worst_reward, best_reward = evaluate_policy(model, env)
+                print(
+                    f"Eval mean={mean_reward:.2f}, "
+                    f"worst={worst_reward:.2f}, best={best_reward:.2f}"
+                )
+
+                if mean_reward > best_mean_reward:
+                    best_mean_reward = mean_reward
+                    path = save_checkpoint(model, BEST_MEAN_CHECKPOINT, update_latest=False)
+                    print(f"Saved best mean checkpoint: {path}")
+
+                if worst_reward > best_worst_reward:
+                    best_worst_reward = worst_reward
+                    path = save_checkpoint(model, BEST_WORST_CHECKPOINT, update_latest=False)
+                    print(f"Saved best worst checkpoint: {path}")
+
+                while next_eval_step <= steps_done:
+                    next_eval_step += EVAL_INTERVAL_STEPS
+                obs, info = env.reset()
+                episode_reward = 0.0
+                episode_steps = 0
     finally:
         if env is not None:
             env.close()
