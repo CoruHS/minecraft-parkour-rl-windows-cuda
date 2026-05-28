@@ -37,7 +37,9 @@ BEST_MEAN_CHECKPOINT = "best_mean.pt"
 BEST_WORST_CHECKPOINT = "best_worst.pt"
 
 # PPO entropy bonus coefficient. Lower = sharper / less exploratory policy.
-ENTROPY_COEF = 0.001
+# 0.001 let the policy collapse to top_prob~0.87 and argmax to a single-action sequence;
+# 0.01 keeps enough spread that argmax tracks the actual best action per state.
+ENTROPY_COEF = 0.01
 # Camera curriculum: mask yaw/pitch actions during the first N training steps so the agent
 # learns clean forward/jump movement before camera control enters the action space.
 # Set to 0 to disable. Eval is NEVER masked.

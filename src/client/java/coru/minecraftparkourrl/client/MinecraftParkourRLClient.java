@@ -27,7 +27,7 @@ import java.nio.file.Path;
 import java.util.Base64;
 
 public class MinecraftParkourRLClient implements ClientModInitializer {
-	private static final float TICKRATE = 100.0F;
+	private static final float TICKRATE = 20.0F;
 	private static final String WORLD_FOLDER = "ParkourRL";
 	private static final int LAN_PORT = 25565;
 	private static final String LAN_PORT_FILE = "parkour_lan_port.txt";
@@ -249,11 +249,6 @@ public class MinecraftParkourRLClient implements ClientModInitializer {
 		state.add(input.pressingRight ? 1.0 : 0.0);
 		state.add(input.jumping ? 1.0 : 0.0);
 		state.add(client.options.sprintKey.isPressed() ? 1.0 : 0.0);
-		// Player position, normalized so magnitudes stay on the same order as the other features.
-		// Lane width ~few blocks, jump height a few blocks, course length ~100 blocks toward z=98.
-		state.add(player.getX() / 5.0);
-		state.add((player.getY() - 1.0) / 5.0);
-		state.add(player.getZ() / 100.0);
 
 		return state;
 	}

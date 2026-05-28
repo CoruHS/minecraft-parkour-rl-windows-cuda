@@ -39,13 +39,17 @@ def find_latest_checkpoint():
     return max(unique_candidates, key=lambda path: path.stat().st_mtime)
 
 
-def choose_action(model, obs, sample=False):
+def choose_action(model, obs, sample=False, temperature=1.0):
+    """Pick an action. sample=False -> argmax (temperature ignored).
+    sample=True -> categorical sample after dividing logits by `temperature`.
+    Lower temperature sharpens toward argmax; higher temperature flattens toward uniform.
+    """
     with torch.no_grad():
         frame = torch.as_tensor(obs["frame"], dtype=torch.float32).unsqueeze(0)
         mlp_state = torch.as_tensor(obs["mlp"], dtype=torch.float32).unsqueeze(0)
         logits, _ = model(frame, mlp_state)
         if sample:
-            dist = torch.distributions.Categorical(logits=logits)
+            dist = torch.distributions.Categorical(logits=logits / max(temperature, 1e-6))
             return int(dist.sample().item())
         return int(torch.argmax(logits, dim=-1).item())
 
@@ -76,6 +80,13 @@ def parse_args():
         "--sample",
         action="store_true",
         help="Sample from action probabilities instead of using argmax.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature (only used with --sample). 1.0 = raw probs, "
+             "0.5 = sharpened toward top action, >1 = flattened.",
     )
     return parser.parse_args()
 
@@ -123,7 +134,9 @@ def main():
             steps = 0
 
             while True:
-                action = choose_action(model, obs, sample=args.sample)
+                action = choose_action(
+                    model, obs, sample=args.sample, temperature=args.temperature,
+                )
                 obs, reward, terminated, truncated, info = env.step(action)
                 episode_reward += reward
                 steps += 1

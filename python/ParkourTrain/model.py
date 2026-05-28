@@ -32,7 +32,7 @@ class ParkourMLP(nn.Module):
             return action.item(), dist.log_prob(action).squeeze(), value.squeeze()
 
 class ParkourCNN(nn.Module):
-    def __init__(self, num_actions, mlp_input_size=17, stack_size=4):
+    def __init__(self, num_actions, mlp_input_size=14, stack_size=4):
         super().__init__()
 
         self.cnn = nn.Sequential(
