@@ -1,12 +1,16 @@
 """Plot CNN training/eval reward over time.
 
-Reads the CSV logs written by train_cnn.py and saves PNGs to training_logs/.
+Reads the CSV logs written by train_cnn.py and saves PNGs next to them.
 Does not touch Minecraft and can be run any time, even while training (the
 CSVs are appended live).
+
+Each training run writes to its own training_logs/run_<timestamp>/ directory.
+By default this script plots the newest such run; use --run to pick another.
 
 Usage:
     python3 python/ParkourTrain/plot_rewards.py
     python3 python/ParkourTrain/plot_rewards.py --window 100
+    python3 python/ParkourTrain/plot_rewards.py --run run_20260528_143012
 """
 
 import argparse
@@ -20,8 +24,23 @@ import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOG_DIR = PROJECT_ROOT / "training_logs"
-EPISODE_LOG_PATH = LOG_DIR / "episodes_cnn.csv"
-EVAL_LOG_PATH = LOG_DIR / "eval_cnn.csv"
+
+
+def find_latest_run_dir():
+    """Return the newest training_logs/run_* directory, or None if there isn't one.
+
+    Falls back to LOG_DIR itself if pre-run-id CSVs exist there (backward compat).
+    """
+    if not LOG_DIR.exists():
+        return None
+    candidates = sorted(
+        (p for p in LOG_DIR.glob("run_*") if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if candidates:
+        return candidates[-1]
+    legacy_csv = LOG_DIR / "episodes_cnn.csv"
+    return LOG_DIR if legacy_csv.exists() else None
 
 
 def read_csv(path):
@@ -44,9 +63,9 @@ def moving_average(values, window):
     return x, averaged
 
 
-def plot_training(rows, window, out_path):
+def plot_training(rows, window, out_path, source_path):
     if not rows:
-        print(f"No training rows in {EPISODE_LOG_PATH}; skipping training plot.")
+        print(f"No training rows in {source_path}; skipping training plot.")
         return
     episodes = [int(r["episode"]) for r in rows]
     rewards = [float(r["episode_reward"]) for r in rows]
@@ -70,9 +89,9 @@ def plot_training(rows, window, out_path):
     print(f"Saved {out_path}")
 
 
-def plot_eval(rows, out_path):
+def plot_eval(rows, out_path, source_path):
     if not rows:
-        print(f"No eval rows in {EVAL_LOG_PATH}; skipping eval plot "
+        print(f"No eval rows in {source_path}; skipping eval plot "
               "(run train_cnn.py until at least one eval happens).")
         return
     steps = [int(r["steps_done"]) for r in rows]
@@ -108,14 +127,37 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Plot CNN reward over time.")
     parser.add_argument("--window", type=int, default=50,
                         help="Moving-average window for the training reward plot.")
+    parser.add_argument("--run", type=str, default=None,
+                        help="Run directory to plot (e.g. 'run_20260528_143012'). "
+                             "Defaults to the newest run under training_logs/.")
     return parser.parse_args()
+
+
+def resolve_run_dir(run_arg):
+    if run_arg is None:
+        run_dir = find_latest_run_dir()
+        if run_dir is None:
+            raise FileNotFoundError(
+                f"No run directory or legacy CSV found under {LOG_DIR}. "
+                "Run train_cnn.py first or pass --run."
+            )
+        return run_dir
+    candidate = Path(run_arg)
+    if not candidate.is_absolute():
+        candidate = LOG_DIR / candidate
+    if not candidate.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {candidate}")
+    return candidate
 
 
 def main():
     args = parse_args()
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    plot_training(read_csv(EPISODE_LOG_PATH), args.window, LOG_DIR / "reward_training.png")
-    plot_eval(read_csv(EVAL_LOG_PATH), LOG_DIR / "reward_eval.png")
+    run_dir = resolve_run_dir(args.run)
+    print(f"Plotting run: {run_dir}")
+    episode_csv = run_dir / "episodes_cnn.csv"
+    eval_csv = run_dir / "eval_cnn.csv"
+    plot_training(read_csv(episode_csv), args.window, run_dir / "reward_training.png", episode_csv)
+    plot_eval(read_csv(eval_csv), run_dir / "reward_eval.png", eval_csv)
 
 
 if __name__ == "__main__":

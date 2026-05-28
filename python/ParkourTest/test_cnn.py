@@ -50,8 +50,12 @@ def choose_action(model, obs, sample=False):
         return int(torch.argmax(logits, dim=-1).item())
 
 
-def load_model(checkpoint_path, num_actions, stack_size):
-    model = ParkourCNN(num_actions=num_actions, stack_size=stack_size)
+def load_model(checkpoint_path, num_actions, mlp_input_size, stack_size):
+    model = ParkourCNN(
+        num_actions=num_actions,
+        mlp_input_size=mlp_input_size,
+        stack_size=stack_size,
+    )
     state_dict = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(state_dict)
     model.eval()
@@ -99,7 +103,12 @@ def main():
             wait_for_minecraft_socket(process)
 
         env = ParkourRL(max_steps=args.max_steps)
-        model = load_model(checkpoint_path, len(env.action_table), env.stack_size)
+        model = load_model(
+            checkpoint_path,
+            len(env.action_table),
+            env.obs_shape["mlp"][1],
+            env.stack_size,
+        )
         print(f"Loaded checkpoint: {checkpoint_path}")
 
         obs, info = env.reset()

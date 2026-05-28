@@ -23,8 +23,12 @@ from env_cnn import (
 from model import ParkourCNN
 
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints_cnn"
-EPISODE_LOG_PATH = PROJECT_ROOT / "training_logs" / "episodes_cnn.csv"
-EVAL_LOG_PATH = PROJECT_ROOT / "training_logs" / "eval_cnn.csv"
+# Each training invocation gets its own log directory so CSVs from different runs
+# never get appended together (the old single-file layout silently concatenated runs).
+RUN_ID = time.strftime("%Y%m%d_%H%M%S")
+RUN_LOG_DIR = PROJECT_ROOT / "training_logs" / f"run_{RUN_ID}"
+EPISODE_LOG_PATH = RUN_LOG_DIR / "episodes_cnn.csv"
+EVAL_LOG_PATH = RUN_LOG_DIR / "eval_cnn.csv"
 EPISODE_CHECKPOINT_INTERVAL = 50
 STEP_CHECKPOINT_INTERVAL = 50_000
 EVAL_INTERVAL_STEPS = 10_000
@@ -369,6 +373,9 @@ def train():
     process = None
     log_file = None
 
+    print(f"Run id: {RUN_ID}")
+    print(f"Logging to: {RUN_LOG_DIR}")
+
     try:
         if _can_connect_to_minecraft(timeout=0.5):
             print("Existing Minecraft RL socket detected; using the running client.")
@@ -385,7 +392,12 @@ def train():
         print(f"Training on device: {device}"
               + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
-        model = ParkourCNN(num_actions=num_actions, stack_size=env.stack_size).to(device)
+        mlp_input_size = env.obs_shape["mlp"][1]
+        model = ParkourCNN(
+            num_actions=num_actions,
+            mlp_input_size=mlp_input_size,
+            stack_size=env.stack_size,
+        ).to(device)
         optimizer = optim.AdamW(model.parameters(),lr = 0.0003, weight_decay =0.01)
         buffer = RolloutBuffer()
 
@@ -401,6 +413,10 @@ def train():
         best_mean_reward = -float("inf")
         best_worst_reward = -float("inf")
         training_start_time = time.time()
+        # Inference timing probe: average ms per action selection across the current rollout.
+        # Useful for confirming whether Python (CNN forward) is the bottleneck vs. the game tick.
+        infer_time_total = 0.0
+        infer_time_count = 0
 
         obs, info = env.reset()
 
@@ -408,10 +424,13 @@ def train():
             # ---- collect experience ----
             for _ in range(rollout_steps):
                 camera_masked = steps_done < MASK_CAMERA_ACTIONS_INITIAL_STEPS
+                infer_start = time.perf_counter()
                 if camera_masked:
                     action, log_prob, value = choose_action_sampled_masked(model, obs, CAMERA_ACTION_IDS)
                 else:
                     action, log_prob, value = model.get_action(obs)
+                infer_time_total += time.perf_counter() - infer_start
+                infer_time_count += 1
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
 
@@ -470,12 +489,18 @@ def train():
                 steps_done,
                 total_timesteps,
             )
+            avg_infer_ms = (
+                1000.0 * infer_time_total / infer_time_count if infer_time_count else 0.0
+            )
             print(
                 f"Progress {steps_done}/{total_timesteps}  "
                 f"elapsed={format_duration(elapsed_seconds)}  "
                 f"speed={steps_per_second:.2f} steps/s  "
+                f"infer={avg_infer_ms:.1f} ms/step  "
                 f"eta={format_duration(eta_seconds)}"
             )
+            infer_time_total = 0.0
+            infer_time_count = 0
 
             if steps_done - last_step_checkpoint >= STEP_CHECKPOINT_INTERVAL:
                 path = save_checkpoint(model, f"checkpoint_step_{steps_done}.pt")

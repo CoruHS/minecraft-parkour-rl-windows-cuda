@@ -284,8 +284,10 @@ class ParkourRL(gym.Env):
         self.socket.close()
 
     def _obs_from_packet(self, packet):
-        # converts the mlp line in console into obs so that env can output numbers for train code
-        return np.asarray(packet["mlp_state"], dtype=np.float32)
+        # MLP-only path keeps the original 14-feature obs; Java appends extra features
+        # (position) at the end for the CNN path. Slice them off here so this env
+        # stays compatible with old MLP checkpoints.
+        return np.asarray(packet["mlp_state"], dtype=np.float32)[:14]
 
     def _position_from_packet(self, packet):
         pos = packet["position"]

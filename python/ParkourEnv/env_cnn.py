@@ -175,8 +175,8 @@ class ParkourRL(gym.Env):
     def __init__(self,
                  log_path: str = "run/logs/latest.log",
                  stack_size: int = 4,
-                 action_repeat: int = 2,
-                 tickrate: float = 80.0,
+                 action_repeat: int = 1,
+                 tickrate: float = 60.0,
                  goal_position=None,
                  goal_x: float = goal_x,
                  goal_y: float = goal_y,
@@ -190,7 +190,7 @@ class ParkourRL(gym.Env):
                  yaw_penalty: float = 0.01,
                  pitch_penalty: float = 0.005,
                  time_penalty: float = 0.005,
-                 fall_penalty: float = 5.0,
+                 fall_penalty: float = 25.0,
                  goal_bonus: float = 50.0,
                  camera_action_penalty: float = 0.0,
                  action_table: list = ACTION_TABLE,
@@ -202,7 +202,7 @@ class ParkourRL(gym.Env):
         self.action_repeat = action_repeat
         self.tickrate = tickrate
         self.fall_y = chosen_height if fall_y is None else fall_y
-        self.state_stack = np.zeros((self.stack_size, 14), dtype=np.float32)
+        self.state_stack = np.zeros((self.stack_size, 17), dtype=np.float32)
         self.last_position = None
         self.action_table = action_table
         self.action_space = gym.spaces.Discrete(len(self.action_table))
@@ -241,7 +241,7 @@ class ParkourRL(gym.Env):
             self.progress_dir = np.zeros(3, dtype=np.float32)
         self.obs_shape = {
             "frame": (self.stack_size * FRAME_C, FRAME_H, FRAME_W),
-            "mlp": (self.stack_size, 14),
+            "mlp": (self.stack_size, 17),
         }
         self.goal_radius = 1.5
         self.frame_stack = np.zeros(self.obs_shape["frame"], dtype=np.float32)
@@ -258,7 +258,7 @@ class ParkourRL(gym.Env):
         # this command can change so its a place holder for now.
         super().reset(seed=seed)
         self.elapsed_steps = 0
-        self.state_stack = np.zeros((self.stack_size, 14), dtype=np.float32)
+        self.state_stack = np.zeros((self.stack_size, 17), dtype=np.float32)
         self.frame_stack = np.zeros(self.obs_shape["frame"], dtype=np.float32)
 
 
@@ -289,9 +289,9 @@ class ParkourRL(gym.Env):
                 f"latest position was {current_position.tolist()}"
             )
 
-        obs_14 = self._obs_from_packet(packet)
+        obs_mlp = self._obs_from_packet(packet)
 
-        self.state_stack = np.repeat(obs_14[np.newaxis, :], self.stack_size, axis=0)
+        self.state_stack = np.repeat(obs_mlp[np.newaxis, :], self.stack_size, axis=0)
         frame = self._frame_from_packet(packet)
         self.frame_stack = np.concatenate([frame] * self.stack_size, axis=0)
         self.last_position = current_position
