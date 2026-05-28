@@ -48,7 +48,13 @@ CAMERA_ACTION_IDS = {14, 15, 16, 17, 18, 19}
 # Finite (not -inf) so masked actions get ~0 probability without producing NaN entropy.
 MASKED_LOGIT_VALUE = -1e9
 # Flat reward penalty per camera (yaw/pitch) action, applied by the env. 0.0 disables it.
+# (No-op when using the MINIMAL_ACTION_TABLE which has no camera actions.)
 CAMERA_ACTION_PENALTY = 0.02
+# Per-platform landing bonus. Gives PPO a clean discrete signal each time the agent
+# lands on a platform farther along the course than ever before this episode.
+# Strong enough to dominate noise but small relative to the goal bonus (+50).
+PLATFORM_REWARD = 2.0
+PLATFORM_Z_STEP = 1.0
 
 class RolloutBuffer:
     def __init__(self):
@@ -387,7 +393,11 @@ def train():
             print("Waiting for Minecraft socket...")
             wait_for_minecraft_socket(process)
 
-        env = ParkourRL(camera_action_penalty=CAMERA_ACTION_PENALTY)
+        env = ParkourRL(
+            camera_action_penalty=CAMERA_ACTION_PENALTY,
+            platform_reward=PLATFORM_REWARD,
+            platform_z_step=PLATFORM_Z_STEP,
+        )
         num_actions = len(env.action_table)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

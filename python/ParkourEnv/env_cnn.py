@@ -51,7 +51,7 @@ def _action(
     }
 
 
-ACTION_TABLE = [
+FULL_ACTION_TABLE = [
     # 0: release every key / no-op
     _action(),
     # 1: careful forward movement
@@ -84,6 +84,22 @@ ACTION_TABLE = [
     _action(pitch_delta=-PITCH_STEP),
     _action(pitch_delta=PITCH_STEP),
 ]
+
+# Minimal action set for straight-line 1-block-gap parkour. Drops camera, diagonals,
+# and crucially the sprint+jump combo (which overshoots 1-block gaps - it clears
+# ~3-4 blocks of horizontal distance). Smaller search space = much faster convergence.
+# Switch to FULL_ACTION_TABLE for varied/diagonal/long-gap courses later.
+MINIMAL_ACTION_TABLE = [
+    _action(),                                  # 0: no-op (brake)
+    _action(forward=True),                      # 1: walk forward
+    _action(forward=True, sprint=True),         # 2: sprint forward (no jump)
+    _action(forward=True, jump=True),           # 3: walk-jump (right size for 1-block gaps)
+    _action(jump=True),                         # 4: jump in place
+    _action(back=True),                         # 5: walk back (brake)
+]
+
+# Default points at the minimal set; train_cnn.py can override via action_table=...
+ACTION_TABLE = MINIMAL_ACTION_TABLE
 
 # parameters
 x = 0
@@ -201,6 +217,8 @@ class ParkourRL(gym.Env):
                  fall_penalty: float = 5.0,
                  goal_bonus: float = 50.0,
                  camera_action_penalty: float = 0.0,
+                 platform_reward: float = 0.0,
+                 platform_z_step: float = 1.0,
                  action_table: list = ACTION_TABLE,
                  max_steps=1000):
         # Initilize basically all the variables the code will utilize(yes theres that many).
@@ -228,6 +246,12 @@ class ParkourRL(gym.Env):
         self.fall_penalty = fall_penalty
         self.goal_bonus = goal_bonus
         self.camera_action_penalty = camera_action_penalty
+        # Discrete bonus each time the player lands on a platform farther along z than
+        # ever before in this episode. Gives PPO a clean per-platform credit signal that
+        # the continuous progress reward alone doesn't provide. 0.0 disables.
+        self.platform_reward = platform_reward
+        self.platform_z_step = platform_z_step
+        self.furthest_landed_z = None
         # Whether the most recent action moved the camera (yaw/pitch); set in step().
         self.last_action_is_camera = False
         self.host = MINECRAFT_HOST
@@ -309,6 +333,8 @@ class ParkourRL(gym.Env):
         self.frame_stack = np.concatenate([frame] * self.stack_size, axis=0)
         self.last_position = current_position
         self.last_distance_to_goal = np.linalg.norm(current_position - self.goal_position)
+        # Track farthest-z platform landed on, for the per-platform bonus.
+        self.furthest_landed_z = float(current_position[2])
 
         return self._build_obs(), {"packet": packet}
 
@@ -387,6 +413,19 @@ class ParkourRL(gym.Env):
         reward -= pitch_error * self.pitch_penalty
 
         reward -= self.time_penalty
+
+        # Per-platform landing bonus. Fires when the player is on the ground AND has reached
+        # a z farther along the course than ever before in this episode. Gives PPO a clean
+        # discrete credit signal ("you crossed a gap") on top of the continuous progress reward.
+        if self.platform_reward > 0.0:
+            mlp_state = packet.get("mlp_state")
+            on_ground = bool(mlp_state[6]) if mlp_state and len(mlp_state) > 6 else False
+            current_z = float(current_position[2])
+            if on_ground and self.furthest_landed_z is not None and (
+                current_z >= self.furthest_landed_z + self.platform_z_step
+            ):
+                reward += self.platform_reward
+                self.furthest_landed_z = current_z
 
         # Optional flat penalty for choosing a camera (yaw/pitch) action at all. Off by default
         # (camera_action_penalty=0.0); applied per telemetry tick like the other penalties above.
