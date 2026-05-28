@@ -200,7 +200,7 @@ def ppo_update(model, optimizer, buffer, device, epochs = 4, clip_epsilon= 0.2, 
             logits, values_pred = model(batch_frames, batch_mlp_states)
             # Re-apply the camera mask for transitions collected under the curriculum mask,
             # so recomputed log-probs/entropy come from the same distribution that acted.
-            if batch_masked.any():
+            if batch_masked.any() and camera_cols.numel() > 0:
                 logits = logits.clone()
                 rows = batch_masked.nonzero(as_tuple=True)[0]
                 logits[rows.unsqueeze(1), camera_cols.unsqueeze(0)] = MASKED_LOGIT_VALUE
@@ -399,6 +399,10 @@ def train():
             platform_z_step=PLATFORM_Z_STEP,
         )
         num_actions = len(env.action_table)
+        # Filter camera mask IDs to the current action table. MINIMAL_ACTION_TABLE has no
+        # camera actions, so this becomes an empty set and the curriculum is a no-op.
+        global CAMERA_ACTION_IDS
+        CAMERA_ACTION_IDS = {i for i in CAMERA_ACTION_IDS if i < num_actions}
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Training on device: {device}"
