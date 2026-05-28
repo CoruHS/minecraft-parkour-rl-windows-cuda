@@ -27,7 +27,7 @@ import java.nio.file.Path;
 import java.util.Base64;
 
 public class MinecraftParkourRLClient implements ClientModInitializer {
-	private static final float TICKRATE = 60.0F;
+	private static final float TICKRATE = 100.0F;
 	private static final String WORLD_FOLDER = "ParkourRL";
 	private static final int LAN_PORT = 25565;
 	private static final String LAN_PORT_FILE = "parkour_lan_port.txt";

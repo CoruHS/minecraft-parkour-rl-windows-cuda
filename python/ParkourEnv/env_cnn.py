@@ -96,7 +96,15 @@ goal_x = 0
 goal_y = 1.0
 goal_z = 98.0
 RESET_POSITION_TOLERANCE = 0.75
-RESET_WAIT_PACKETS = 80
+# Tickrate-agnostic: at 100 TPS this is ~2 s wall-clock; at 40 TPS ~5 s. Older value (80)
+# was tuned for 40 TPS and was too tight at higher client tickrates because the integrated
+# server still runs at 20 TPS, so the tp round-trip eats a bigger fraction of the budget.
+RESET_WAIT_PACKETS = 200
+# Re-send tp every N packets if the player still isn't at the target. Handles two cases:
+#   1) the first tp packet got swallowed or processed after the player had already left,
+#   2) /tp does not zero player velocity in vanilla 1.20.1, so a player falling at
+#      terminal velocity gets teleported but immediately falls again.
+RESET_TP_RESEND_EVERY = 10
 
 
 def _can_connect_to_minecraft(timeout=1.0):
@@ -262,7 +270,7 @@ class ParkourRL(gym.Env):
         self.frame_stack = np.zeros(self.obs_shape["frame"], dtype=np.float32)
 
 
-        self._send_action({
+        reset_action = {
             "command": f"tp @p {x} {y} {z} {base_yaw} {base_pitch}",
             "forward": False,
             "back": False,
@@ -272,17 +280,22 @@ class ParkourRL(gym.Env):
             "sprint": False,
             "yaw_delta": 0.0,
             "pitch_delta": 0.0,
-        })
+        }
+        self._send_action(reset_action)
 
         target_position = np.array([x, y, z], dtype=np.float32)
         packet = None
         current_position = None
 
-        for _ in range(RESET_WAIT_PACKETS):
+        for i in range(RESET_WAIT_PACKETS):
             packet = self._wait_for_telemetry()
             current_position = self._position_from_packet(packet)
             if np.linalg.norm(current_position - target_position) <= RESET_POSITION_TOLERANCE:
                 break
+            # Player not back yet — re-send tp periodically. Robust to a dropped command
+            # and to /tp not resetting fall velocity (player keeps falling otherwise).
+            if i > 0 and i % RESET_TP_RESEND_EVERY == 0:
+                self._send_action(reset_action)
         else:
             raise RuntimeError(
                 f"Reset did not reach target position {target_position.tolist()}; "
