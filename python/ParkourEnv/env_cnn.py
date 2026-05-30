@@ -3,6 +3,7 @@ import gymnasium as gym
 import time
 import json
 import os
+import random
 import socket
 import subprocess
 from pathlib import Path
@@ -100,6 +101,58 @@ MINIMAL_ACTION_TABLE = [
 
 # Default points at the minimal set; train_cnn.py can override via action_table=...
 ACTION_TABLE = MINIMAL_ACTION_TABLE
+
+
+def make_multihead_action(w_bit, jump_bit, sprint_bit=0):
+    """Build the action dict the multi-head policy emits.
+
+    Sprint is now its own independent bit (ctrl key), not tied to W. This is what
+    lets one policy span courses of different gap sizes: walk-jump clears short
+    gaps, sprint-jump clears long ones, so the agent picks jump distance per gap.
+    Sprint without forward is a no-op in vanilla MC (you only sprint while moving
+    forward), so no special handling is needed for the (sprint=1, w=0) combo.
+    No camera here; add yaw/pitch heads later for diagonals.
+    """
+    return _action(
+        forward=bool(w_bit),
+        sprint=bool(sprint_bit),
+        jump=bool(jump_bit),
+    )
+
+
+class Course:
+    """A single parkour course: a start pose and a goal, all in the same world.
+
+    Different courses live at different x-lanes of the same Minecraft world, so
+    switching courses is just teleporting to a different start/goal. progress_dir
+    and center_x are precomputed so reset/reward can swap courses for free.
+    """
+
+    def __init__(self, name, start, goal, yaw=0.0, pitch=0.0, fall_y=0.0):
+        self.name = name
+        self.start = np.asarray(start, dtype=np.float32)
+        self.goal = np.asarray(goal, dtype=np.float32)
+        self.yaw = float(yaw)
+        self.pitch = float(pitch)
+        self.fall_y = float(fall_y)
+        delta = self.goal - self.start
+        horizontal = np.array([delta[0], 0.0, delta[2]], dtype=np.float32)
+        distance = float(np.linalg.norm(horizontal))
+        self.progress_dir = (
+            horizontal / distance if distance > 1e-6 else np.zeros(3, dtype=np.float32)
+        )
+        # Lane center for the lane-deviation penalty is the course's own x.
+        self.center_x = float(self.start[0])
+
+
+# Registry of the courses that live in the world. All run in +z on their own x-lane
+# (so yaw stays 0). Add 4-block / varied-height / diagonal courses here later.
+COURSES = {
+    "1block": Course("1block", start=(0, 1, 0), goal=(0, 1, 98)),
+    "2block": Course("2block", start=(-5, 1, 0), goal=(-5, 1, 99)),
+    "3block": Course("3block", start=(-11, 1, 0), goal=(-11, 1, 100)),
+    "mixed": Course("mixed", start=(-19, 1, 0), goal=(-19, 1, 98)),
+}
 
 # parameters
 x = 0
@@ -199,7 +252,7 @@ class ParkourRL(gym.Env):
     def __init__(self,
                  log_path: str = "run/logs/latest.log",
                  stack_size: int = 4,
-                 action_repeat: int = 1,
+                 action_repeat: int = 5,
                  tickrate: float = 60.0,
                  goal_position=None,
                  goal_x: float = goal_x,
@@ -220,6 +273,8 @@ class ParkourRL(gym.Env):
                  platform_reward: float = 0.0,
                  platform_z_step: float = 1.0,
                  action_table: list = ACTION_TABLE,
+                 courses=None,
+                 random_courses: bool = False,
                  max_steps=1000):
         # Initilize basically all the variables the code will utilize(yes theres that many).
         # More variables will be added later for CNN + MLP implementation
@@ -227,7 +282,8 @@ class ParkourRL(gym.Env):
         self.stack_size = stack_size
         self.action_repeat = action_repeat
         self.tickrate = tickrate
-        self.fall_y = chosen_height if fall_y is None else fall_y
+        # Optional env-level fall_y override; when None each course supplies its own.
+        self.fall_y_override = fall_y
         self.state_stack = np.zeros((self.stack_size, 14), dtype=np.float32)
         self.last_position = None
         self.action_table = action_table
@@ -235,9 +291,6 @@ class ParkourRL(gym.Env):
         self.max_steps = max_steps
         self.elapsed_steps = 0
         self.last_distance_to_goal = None
-        self.center_x = center_x
-        self.target_yaw = target_yaw
-        self.target_pitch = target_pitch
         self.progress_weight = progress_weight
         self.lane_penalty = lane_penalty
         self.yaw_penalty = yaw_penalty
@@ -259,18 +312,37 @@ class ParkourRL(gym.Env):
         self.socket = socket.create_connection((self.host, self.port), timeout=10)
         self.reader = self.socket.makefile('r', encoding="utf-8")
         self.writer = self.socket.makefile("w", encoding="utf-8")
-        # I will choose and initialize a goal coordinate myself
-        if goal_position is None:
-            goal_position = (goal_x, goal_y, goal_z)
-        self.goal_position = np.asarray(goal_position, dtype=np.float32)
-        self.start_position = np.array([x, y, z], dtype=np.float32)
-        goal_delta = self.goal_position - self.start_position
-        horizontal_goal_delta = np.array([goal_delta[0], 0.0, goal_delta[2]], dtype=np.float32)
-        horizontal_goal_distance = np.linalg.norm(horizontal_goal_delta)
-        if horizontal_goal_distance > 1e-6:
-            self.progress_dir = horizontal_goal_delta / horizontal_goal_distance
-        else:
-            self.progress_dir = np.zeros(3, dtype=np.float32)
+        # Course set. Default (courses=None) = a single course built from the legacy
+        # start globals + goal params, so existing single-course callers are unchanged.
+        if courses is None:
+            if goal_position is None:
+                goal_position = (goal_x, goal_y, goal_z)
+            default_fall_y = chosen_height if fall_y is None else fall_y
+            courses = [Course(
+                "default",
+                start=(x, y, z),
+                goal=goal_position,
+                yaw=base_yaw,
+                pitch=base_pitch,
+                fall_y=default_fall_y,
+            )]
+        self.courses = list(courses)
+        self.courses_by_name = {c.name: c for c in self.courses}
+        self.random_courses = random_courses
+        # Sampling pool: the subset of self.courses that random resets draw from. It stays
+        # = self.courses by default, but a curriculum can shrink/grow it via
+        # set_sampling_courses() without touching self.courses (which eval still indexes by
+        # name for explicit per-course resets).
+        self.sampling_courses = list(self.courses)
+        # Block sampling: hold one randomly-chosen lane for course_block_size consecutive
+        # resets before rolling a new one, so the agent gets repeated tries on the same gap
+        # instead of being teleported to a fresh lane on every fall.
+        self.course_block_size = 1
+        self._block_course = None        # the lane currently being repeated
+        self._block_resets_left = 0      # resets remaining before a new lane is rolled
+        # Apply the first course so start/goal/progress_dir/center_x are populated
+        # before the first reset (reset re-selects per its course argument / randomness).
+        self._apply_course(self.courses[0])
         self.obs_shape = {
             "frame": (self.stack_size * FRAME_C, FRAME_H, FRAME_W),
             "mlp": (self.stack_size, 14),
@@ -284,18 +356,84 @@ class ParkourRL(gym.Env):
             "mlp": gym.spaces.Box(-np.inf, np.inf, shape=self.obs_shape["mlp"], dtype=np.float32),
         })
 
-    def reset(self, seed=None):
-        # Reset the player back to the start everytime a certain condition(height < fall_y) is activated
-        # first three zeroes indicate coordinate. the next 2 zeroes indicate pitch and yaw
-        # this command can change so its a place holder for now.
+    def _resolve_course(self, course):
+        """Accept a Course, a course name, or None; return a Course in this env."""
+        if course is None:
+            return None
+        if isinstance(course, Course):
+            return course
+        try:
+            return self.courses_by_name[course]
+        except KeyError:
+            raise ValueError(
+                f"Unknown course {course!r}; known courses: {list(self.courses_by_name)}"
+            )
+
+    def set_sampling_courses(self, courses, block_size=None):
+        """Set which courses random resets draw from (used by the training curriculum).
+
+        `courses` is a list of Course/name entries that must already be registered in this
+        env (so eval can still resolve them by name). Resetting the pool clears the current
+        block so the next reset rolls a fresh lane from the new pool. `block_size`, if given,
+        updates how many consecutive resets reuse a chosen lane.
+        """
+        resolved = [self._resolve_course(c) for c in courses]
+        for c in resolved:
+            if c is None:
+                raise ValueError("set_sampling_courses got an unresolved (None) course")
+        self.sampling_courses = resolved
+        if block_size is not None:
+            self.course_block_size = max(1, int(block_size))
+        # Force a fresh roll on the next reset so we don't keep replaying a lane that may
+        # no longer be in the pool.
+        self._block_course = None
+        self._block_resets_left = 0
+
+    def _apply_course(self, course):
+        """Point all course-dependent state (start/goal/lane/fall) at `course`."""
+        self.active_course = course
+        self.start_position = course.start.copy()
+        self.goal_position = course.goal.copy()
+        self.progress_dir = course.progress_dir.copy()
+        self.center_x = course.center_x
+        self.target_yaw = course.yaw
+        self.target_pitch = course.pitch
+        self.fall_y = (
+            self.fall_y_override if self.fall_y_override is not None else course.fall_y
+        )
+
+    def reset(self, seed=None, course=None):
+        # Reset the player back to the start everytime a certain condition(height < fall_y) is activated.
+        # Course selection: an explicit `course` wins (used by per-course eval); otherwise
+        # random_courses picks one uniformly each episode (domain randomization for training);
+        # otherwise the first course is reused.
         super().reset(seed=seed)
+        chosen = self._resolve_course(course)
+        if chosen is None:
+            pool = self.sampling_courses or self.courses
+            if self.random_courses and len(pool) > 1:
+                # Roll a new lane only when the current block is exhausted (or the held lane
+                # dropped out of the pool); otherwise reuse it for course_block_size tries.
+                if (self._block_course is None
+                        or self._block_resets_left <= 0
+                        or self._block_course not in pool):
+                    # Prefer a lane different from the one just finished so blocks rotate.
+                    options = [c for c in pool if c is not self._block_course] or pool
+                    self._block_course = random.choice(options)
+                    self._block_resets_left = self.course_block_size
+                chosen = self._block_course
+                self._block_resets_left -= 1
+            else:
+                chosen = pool[0]
+        self._apply_course(chosen)
+
         self.elapsed_steps = 0
         self.state_stack = np.zeros((self.stack_size, 14), dtype=np.float32)
         self.frame_stack = np.zeros(self.obs_shape["frame"], dtype=np.float32)
 
-
+        sx, sy, sz = (float(v) for v in self.start_position)
         reset_action = {
-            "command": f"tp @p {x} {y} {z} {base_yaw} {base_pitch}",
+            "command": f"tp @p {sx} {sy} {sz} {self.target_yaw} {self.target_pitch}",
             "forward": False,
             "back": False,
             "left": False,
@@ -307,7 +445,7 @@ class ParkourRL(gym.Env):
         }
         self._send_action(reset_action)
 
-        target_position = np.array([x, y, z], dtype=np.float32)
+        target_position = self.start_position
         packet = None
         current_position = None
 
@@ -336,14 +474,19 @@ class ParkourRL(gym.Env):
         # Track farthest-z platform landed on, for the per-platform bonus.
         self.furthest_landed_z = float(current_position[2])
 
-        return self._build_obs(), {"packet": packet}
+        return self._build_obs(), {"packet": packet, "course": self.active_course.name}
 
     def step(self, actionid):
         # step() makes the environment play the game, calculate rewards, and choose actions until reset() is called.
-
-        action = self.action_table[int(actionid)]
+        # Accepts either an int action_id (looked up in action_table) or a pre-built
+        # action dict (used directly). Dict path is for the multi-head policy which
+        # constructs its own key combinations instead of indexing into ACTION_TABLE.
+        if isinstance(actionid, dict):
+            action = actionid
+        else:
+            action = self.action_table[int(actionid)]
         # Remember whether this action moves the camera so _compute_reward can penalize it.
-        self.last_action_is_camera = action["yaw_delta"] != 0.0 or action["pitch_delta"] != 0.0
+        self.last_action_is_camera = action.get("yaw_delta", 0.0) != 0.0 or action.get("pitch_delta", 0.0) != 0.0
         self._send_action(action)
 
         reward = 0.0

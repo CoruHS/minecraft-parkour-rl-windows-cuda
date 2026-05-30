@@ -12,15 +12,17 @@ sys.path.insert(0, str(PARKOUR_ENV_PATH))
 sys.path.insert(0, str(PARKOUR_TRAIN_PATH))
 
 from env_cnn import (
+    COURSES,
     LAN_PORT_PATH,
     RUNCLIENT_LOG_PATH,
     ParkourRL,
     _can_connect_to_minecraft,
     _lan_port_from_info,
+    make_multihead_action,
     start_minecraft_client,
     wait_for_minecraft_socket,
 )
-from model import ParkourCNN
+from model import ParkourCNN, ParkourCNNMultiHead
 
 
 def find_latest_checkpoint():
@@ -40,10 +42,7 @@ def find_latest_checkpoint():
 
 
 def choose_action(model, obs, sample=False, temperature=1.0):
-    """Pick an action. sample=False -> argmax (temperature ignored).
-    sample=True -> categorical sample after dividing logits by `temperature`.
-    Lower temperature sharpens toward argmax; higher temperature flattens toward uniform.
-    """
+    """Pick a categorical action. sample=False -> argmax; sample=True -> sample(logits/temp)."""
     with torch.no_grad():
         frame = torch.as_tensor(obs["frame"], dtype=torch.float32).unsqueeze(0)
         mlp_state = torch.as_tensor(obs["mlp"], dtype=torch.float32).unsqueeze(0)
@@ -54,16 +53,67 @@ def choose_action(model, obs, sample=False, temperature=1.0):
         return int(torch.argmax(logits, dim=-1).item())
 
 
+def choose_action_multihead(model, obs, sample=False, temperature=1.0):
+    """Pick a (w_bit, jump_bit, sprint_bit) tuple from the multi-head model.
+
+    sample=False -> argmax per head. sample=True -> Bernoulli sample with logits/temp.
+    """
+    with torch.no_grad():
+        frame = torch.as_tensor(obs["frame"], dtype=torch.float32).unsqueeze(0)
+        mlp_state = torch.as_tensor(obs["mlp"], dtype=torch.float32).unsqueeze(0)
+        w_logits, jump_logits, sprint_logits, _ = model(frame, mlp_state)
+        if sample:
+            t = max(temperature, 1e-6)
+            w_dist = torch.distributions.Bernoulli(logits=w_logits / t)
+            jump_dist = torch.distributions.Bernoulli(logits=jump_logits / t)
+            sprint_dist = torch.distributions.Bernoulli(logits=sprint_logits / t)
+            w = int(w_dist.sample().item())
+            j = int(jump_dist.sample().item())
+            s = int(sprint_dist.sample().item())
+        else:
+            w = int((w_logits > 0).item())
+            j = int((jump_logits > 0).item())
+            s = int((sprint_logits > 0).item())
+    return w, j, s
+
+
+def _unwrap_checkpoint(raw):
+    """Accept either a raw state_dict (legacy) or {state_dict, meta} (new)."""
+    if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
+        return raw["state_dict"], raw.get("meta", {})
+    return raw, {}
+
+
+def _detect_multi_head(state_dict, meta):
+    if meta.get("model_type") == "multi_head":
+        return True
+    if meta.get("model_type") == "categorical":
+        return False
+    return any(k.startswith("w_head.") or k.startswith("jump_head.") for k in state_dict.keys())
+
+
 def load_model(checkpoint_path, num_actions, mlp_input_size, stack_size):
-    model = ParkourCNN(
-        num_actions=num_actions,
-        mlp_input_size=mlp_input_size,
-        stack_size=stack_size,
-    )
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(state_dict)
+    raw = torch.load(checkpoint_path, map_location="cpu")
+    state_dict, meta = _unwrap_checkpoint(raw)
+    multi_head = _detect_multi_head(state_dict, meta)
+    if multi_head:
+        model = ParkourCNNMultiHead(mlp_input_size=mlp_input_size, stack_size=stack_size)
+        # strict=False so an older 2-head (W+Jump) checkpoint still loads into the
+        # current 3-head model (sprint_head stays at init). New checkpoints load fully.
+        result = model.load_state_dict(state_dict, strict=False)
+        if result.missing_keys:
+            print(f"Warning: checkpoint missing {sorted(result.missing_keys)} (using fresh init for those)")
+        if result.unexpected_keys:
+            print(f"Warning: checkpoint had unused keys {sorted(result.unexpected_keys)}")
+    else:
+        model = ParkourCNN(
+            num_actions=num_actions,
+            mlp_input_size=mlp_input_size,
+            stack_size=stack_size,
+        )
+        model.load_state_dict(state_dict)
     model.eval()
-    return model
+    return model, multi_head
 
 
 def parse_args():
@@ -87,6 +137,18 @@ def parse_args():
         default=1.0,
         help="Sampling temperature (only used with --sample). 1.0 = raw probs, "
              "0.5 = sharpened toward top action, >1 = flattened.",
+    )
+    parser.add_argument(
+        "--no-sample-multihead",
+        action="store_true",
+        help="Force argmax for multi-head checkpoints (debugging only — argmax "
+             "can't reach off-diagonal action buckets like jip=(0,1,0)).",
+    )
+    parser.add_argument(
+        "--course",
+        choices=sorted(COURSES.keys()),
+        default="1block",
+        help="Which course to run (start/goal lane in the world). Default: 1block.",
     )
     return parser.parse_args()
 
@@ -113,14 +175,22 @@ def main():
             print("Waiting for Minecraft socket...")
             wait_for_minecraft_socket(process)
 
-        env = ParkourRL(max_steps=args.max_steps)
-        model = load_model(
+        # Build env first with default repeat, then rebuild if checkpoint is multi-head
+        # so the test cadence matches what training used. The selected course fixes the
+        # start/goal lane for every reset.
+        course = COURSES[args.course]
+        env = ParkourRL(max_steps=args.max_steps, courses=[course])
+        model, multi_head = load_model(
             checkpoint_path,
             len(env.action_table),
             env.obs_shape["mlp"][1],
             env.stack_size,
         )
-        print(f"Loaded checkpoint: {checkpoint_path}")
+        if multi_head and env.action_repeat != 2:
+            env.close()
+            env = ParkourRL(max_steps=args.max_steps, action_repeat=2, courses=[course])
+        print(f"Loaded checkpoint: {checkpoint_path} ({'multi-head' if multi_head else 'categorical'})")
+        print(f"Course: {args.course}  start={course.start.tolist()}  goal={course.goal.tolist()}")
 
         obs, info = env.reset()
         lan_port = _lan_port_from_info(info)
@@ -134,16 +204,29 @@ def main():
             steps = 0
 
             while True:
-                action = choose_action(
-                    model, obs, sample=args.sample, temperature=args.temperature,
-                )
-                obs, reward, terminated, truncated, info = env.step(action)
+                # Multi-head argmax-per-head is structurally broken (can't reach
+                # off-diagonal buckets like jip=(0,1)). Force sampling unless the
+                # user explicitly asks for argmax via --no-sample-multihead.
+                multihead_sample = args.sample or (multi_head and not args.no_sample_multihead)
+                if multi_head:
+                    w, j, s = choose_action_multihead(
+                        model, obs, sample=multihead_sample, temperature=args.temperature,
+                    )
+                    action_display = f"(w={w}, j={j}, s={s})"
+                    step_input = make_multihead_action(w, j, s)
+                else:
+                    action = choose_action(
+                        model, obs, sample=args.sample, temperature=args.temperature,
+                    )
+                    action_display = str(action)
+                    step_input = action
+                obs, reward, terminated, truncated, info = env.step(step_input)
                 episode_reward += reward
                 steps += 1
                 pos = info["packet"]["position"]
 
                 print(
-                    f"\repisode={episode} step={steps} action={action} "
+                    f"\repisode={episode} step={steps} action={action_display} "
                     f"reward={reward:.3f} total={episode_reward:.3f} "
                     f"position=({pos['x']:.2f}, {pos['y']:.2f}, {pos['z']:.2f})",
                     end="",
